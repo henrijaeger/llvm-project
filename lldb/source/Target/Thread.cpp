@@ -385,8 +385,13 @@ lldb::StopInfoSP Thread::GetStopInfo() {
   if (have_valid_stop_info && !plan_overrides_trace && !plan_failed) {
     return m_stop_info_sp;
   } else if (completed_plan_sp) {
-    return StopInfo::CreateStopReasonWithPlan(
+    StopInfoSP plan_stop_info_sp = StopInfo::CreateStopReasonWithPlan(
         completed_plan_sp, GetReturnValueObject(), GetExpressionVariable());
+    // The plan completed at the stop described by the private stop info, so
+    // report when that stop happened.
+    if (m_stop_info_sp && m_stop_info_stop_id == stop_id)
+      plan_stop_info_sp->SetStopTimestamps(m_stop_info_sp->GetStopTimestamps());
+    return plan_stop_info_sp;
   } else {
     GetPrivateStopInfo();
     return m_stop_info_sp;
@@ -394,8 +399,16 @@ lldb::StopInfoSP Thread::GetStopInfo() {
 }
 
 void Thread::CalculatePublicStopInfo() {
+  // Resetting discards the private stop info, so keep its timestamps for the
+  // public stop info that replaces it.
+  StopTimestamps timestamps;
+  if (m_stop_info_sp && StopInfoIsUpToDate())
+    timestamps = m_stop_info_sp->GetStopTimestamps();
   ResetStopInfo();
-  SetStopInfo(GetStopInfo());
+  StopInfoSP stop_info_sp = GetStopInfo();
+  if (stop_info_sp && stop_info_sp->GetStopTimestamps().empty())
+    stop_info_sp->SetStopTimestamps(std::move(timestamps));
+  SetStopInfo(stop_info_sp);
 }
 
 lldb::StopInfoSP Thread::GetPrivateStopInfo(bool calculate) {
@@ -2170,7 +2183,8 @@ bool Thread::GetDescription(Stream &strm, lldb::DescriptionLevel level,
     }
 
     if (print_json_stopinfo && m_stop_info_sp) {
-      StructuredData::ObjectSP stop_info = m_stop_info_sp->GetExtendedInfo();
+      StructuredData::ObjectSP stop_info =
+          m_stop_info_sp->GetExtendedInfoWithStopTimestamps();
       if (stop_info) {
         stop_info->Dump(strm);
         strm.PutCString("\n");

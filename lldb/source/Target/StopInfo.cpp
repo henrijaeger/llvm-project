@@ -48,6 +48,25 @@ bool StopInfo::IsValid() const {
   return false;
 }
 
+StructuredData::ObjectSP StopInfo::GetExtendedInfoWithStopTimestamps() {
+  if (m_stop_timestamps.empty())
+    return m_extended_info;
+  if (m_extended_info && !m_extended_info->GetAsDictionary())
+    return m_extended_info;
+
+  // Copy the entries, so that adding ours cannot change the original. Entries
+  // that are already there are kept.
+  auto dict_sp =
+      m_extended_info
+          ? std::make_shared<StructuredData::Dictionary>(m_extended_info)
+          : std::make_shared<StructuredData::Dictionary>();
+  if (m_stop_timestamps.time && !dict_sp->HasKey("time"))
+    dict_sp->AddStringItem("time", *m_stop_timestamps.time);
+  if (m_stop_timestamps.conttime && !dict_sp->HasKey("conttime"))
+    dict_sp->AddStringItem("conttime", *m_stop_timestamps.conttime);
+  return dict_sp;
+}
+
 void StopInfo::MakeStopInfoValid() {
   ThreadSP thread_sp(m_thread_wp.lock());
   if (thread_sp) {

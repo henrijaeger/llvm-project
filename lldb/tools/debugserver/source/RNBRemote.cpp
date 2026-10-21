@@ -2934,6 +2934,14 @@ rnb_err_t RNBRemote::SendStopReplyPacketForThread(nub_thread_t tid) {
       }
     }
 
+    // When this thread's stop reason was received. Omitted when unknown.
+    // After "thread:", which clients expect to come first.
+    const DNBStopTimestamp &timestamp = tid_stop_info.timestamp;
+    if (timestamp.has_wall_time)
+      ostrm << "time:" << timestamp.WallTimeString() << ';';
+    if (timestamp.has_continuous_time)
+      ostrm << "conttime:" << std::to_string(timestamp.continuous_time) << ';';
+
     // If a 'QListThreadsInStopReply' was sent to enable this feature, we
     // will send all thread IDs back in the "threads" key whose value is
     // a list of hex thread IDs separated by commas:
@@ -5892,6 +5900,16 @@ RNBRemote::GetJSONThreadsInfo(bool threads_with_valid_stop_info_only) {
       }
 
       thread_dict_sp->AddStringItem("reason", reason_value);
+
+      // Strings rather than numbers, so that no JSON reader rounds them.
+      if (stop_info_valid) {
+        const DNBStopTimestamp &timestamp = tid_stop_info.timestamp;
+        if (timestamp.has_wall_time)
+          thread_dict_sp->AddStringItem("time", timestamp.WallTimeString());
+        if (timestamp.has_continuous_time)
+          thread_dict_sp->AddStringItem(
+              "conttime", std::to_string(timestamp.continuous_time));
+      }
 
       if (!threads_with_valid_stop_info_only) {
         const char *thread_name = DNBThreadGetName(pid, tid);

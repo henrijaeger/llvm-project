@@ -203,7 +203,10 @@ bool SBThread::GetStopReasonExtendedInfoAsJSON(lldb::SBStream &stream) {
     return false;
 
   StopInfoSP stop_info = exe_ctx->GetThreadPtr()->GetStopInfo();
-  StructuredData::ObjectSP info = stop_info->GetExtendedInfo();
+  if (!stop_info)
+    return false;
+  StructuredData::ObjectSP info =
+      stop_info->GetExtendedInfoWithStopTimestamps();
   if (!info)
     return false;
 

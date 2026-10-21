@@ -9,6 +9,7 @@
 #ifndef LLDB_TARGET_STOPINFO_H
 #define LLDB_TARGET_STOPINFO_H
 
+#include <optional>
 #include <string>
 
 #include "lldb/Target/Process.h"
@@ -16,6 +17,17 @@
 #include "lldb/lldb-public.h"
 
 namespace lldb_private {
+
+/// When a stop was observed, as reported by the process plugin. The values are
+/// kept in the decimal form they were reported in, so that no digits are lost.
+struct StopTimestamps {
+  /// Wall-clock time since the Unix epoch, as "<seconds>.<nine digits>".
+  std::optional<std::string> time;
+  /// A reading of the target's continuous clock, in that clock's ticks.
+  std::optional<std::string> conttime;
+
+  bool empty() const { return !time && !conttime; }
+};
 
 class StopInfo : public std::enable_shared_from_this<StopInfo> {
   friend class Process::ProcessEventData;
@@ -123,6 +135,18 @@ public:
   }
 
   StructuredData::ObjectSP GetExtendedInfo() { return m_extended_info; }
+
+  /// Record when this stop was observed.
+  void SetStopTimestamps(StopTimestamps timestamps) {
+    m_stop_timestamps = std::move(timestamps);
+  }
+
+  const StopTimestamps &GetStopTimestamps() const { return m_stop_timestamps; }
+
+  /// Returns the extended info with the stop timestamps added under the keys
+  /// "time" and "conttime". The extended info itself is not modified. If it
+  /// is not a dictionary, it is returned without the timestamps.
+  StructuredData::ObjectSP GetExtendedInfoWithStopTimestamps();
 
   /// Returns true if this is a stop reason that should be shown to a user when
   /// viewing the thread with this stop info.
@@ -236,6 +260,8 @@ protected:
 
   StructuredData::ObjectSP
       m_extended_info; // The extended info for this stop info
+
+  StopTimestamps m_stop_timestamps;
 
   // This determines whether the target has run since this stop info. N.B.
   // running to evaluate a user expression does not count.

@@ -13,6 +13,7 @@
 #ifndef LLDB_TOOLS_DEBUGSERVER_SOURCE_MACOSX_MACHEXCEPTION_H
 #define LLDB_TOOLS_DEBUGSERVER_SOURCE_MACOSX_MACHEXCEPTION_H
 
+#include "DNBDefs.h"
 #include <mach/mach.h>
 #include <vector>
 
@@ -43,15 +44,19 @@ public:
     thread_t thread_port;
     exception_type_t exc_type;
     std::vector<mach_exception_data_type_t> exc_data;
+    // When the message carrying this exception was received. See
+    // Message::Receive.
+    DNBStopTimestamp timestamp;
     Data()
         : task_port(TASK_NULL), thread_port(THREAD_NULL), exc_type(0),
-          exc_data() {}
+          exc_data(), timestamp() {}
 
     void Clear() {
       task_port = TASK_NULL;
       thread_port = THREAD_NULL;
       exc_type = 0;
       exc_data.clear();
+      timestamp = {};
     }
     bool IsValid() const {
       return task_port != TASK_NULL && thread_port != THREAD_NULL &&

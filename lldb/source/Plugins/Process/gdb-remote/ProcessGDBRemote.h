@@ -24,6 +24,7 @@
 #include "lldb/Host/HostThread.h"
 #include "lldb/Target/DynamicRegisterInfo.h"
 #include "lldb/Target/Process.h"
+#include "lldb/Target/StopInfo.h"
 #include "lldb/Target/Thread.h"
 #include "lldb/Utility/ArchSpec.h"
 #include "lldb/Utility/Broadcaster.h"
@@ -419,7 +420,8 @@ protected:
                     lldb::addr_t dispatch_queue_t, std::string &queue_name,
                     lldb::QueueKind queue_kind, uint64_t queue_serial,
                     std::vector<lldb::addr_t> &added_binaries,
-                    StructuredData::ObjectSP &detailed_binaries_info);
+                    StructuredData::ObjectSP &detailed_binaries_info,
+                    const StopTimestamps &stop_timestamps);
 
   void ClearThreadIDList();
 

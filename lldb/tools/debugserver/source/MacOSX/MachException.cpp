@@ -18,8 +18,10 @@
 #include "SysSignal.h"
 #include <cerrno>
 #include <inttypes.h>
+#include <mach/mach_time.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
+#include <time.h>
 
 static void AppendExceptionData(std::vector<mach_exception_data_type_t> &out,
                                 mach_exception_data_t data,
@@ -170,6 +172,7 @@ bool MachException::Data::GetStopInfo(
     struct DNBThreadStopInfo *stop_info) const {
   // Zero out the structure.
   memset(stop_info, 0, sizeof(struct DNBThreadStopInfo));
+  stop_info->timestamp = timestamp;
 
   if (exc_type == 0) {
     stop_info->reason = eStopTypeInvalid;
@@ -251,6 +254,20 @@ void MachException::Data::DumpStopReason() const {
   DNBLog("%s", Name(exc_type));
 }
 
+// Reads the clocks for a stop. Continuous time is read first, then wall time,
+// so the two are close to, but not exactly, the same instant.
+static DNBStopTimestamp SampleStopTimestamp() {
+  DNBStopTimestamp timestamp = {};
+  if (__builtin_available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)) {
+    timestamp.continuous_time = mach_continuous_time();
+    timestamp.has_continuous_time = true;
+    timestamp.has_wall_time =
+        clock_gettime(CLOCK_REALTIME, &timestamp.wall_time) == 0 &&
+        timestamp.wall_time.tv_sec >= 0;
+  }
+  return timestamp;
+}
+
 kern_return_t MachException::Message::Receive(mach_port_t port,
                                               mach_msg_option_t options,
                                               mach_msg_timeout_t timeout,
@@ -281,6 +298,12 @@ kern_return_t MachException::Message::Receive(mach_port_t port,
                                      // MACH_RCV_TIMEOUT is ORed into the
                                      // options parameter)
                    notify_port);
+
+  // Note when the exception arrived before doing any other work on it. The
+  // timestamp travels with the exception data, so it is reported only for
+  // the exception it belongs to, and only if that exception is accepted.
+  if (err.Status() == KERN_SUCCESS)
+    state.timestamp = SampleStopTimestamp();
 
   // Dump any errors we get
   if (log_exceptions) {

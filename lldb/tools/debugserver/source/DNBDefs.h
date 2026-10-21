@@ -16,6 +16,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <sys/syslimits.h>
 #include <unistd.h>
@@ -247,6 +248,31 @@ enum DNBMemoryPermissions {
 #define DNB_THREAD_STOP_INFO_MAX_DESC_LENGTH 256
 #define DNB_THREAD_STOP_INFO_MAX_EXC_DATA 8
 
+// DNBStopTimestamp
+//
+// When debugserver received the exception message that reported a stop. The
+// clocks are read one after the other, so the two values describe nearly, but
+// not exactly, the same instant. Either one may be unavailable.
+struct DNBStopTimestamp {
+  // CLOCK_REALTIME. Darwin reports it with microsecond resolution.
+  bool has_wall_time;
+  struct timespec wall_time;
+
+  // mach_continuous_time(), in ticks of the timebase of the machine
+  // debugserver runs on.
+  bool has_continuous_time;
+  uint64_t continuous_time;
+
+  // The wall time as "<seconds>.<nanoseconds as nine digits>".
+  std::string WallTimeString() const {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu.%09ld",
+             static_cast<unsigned long long>(wall_time.tv_sec),
+             static_cast<long>(wall_time.tv_nsec));
+    return buf;
+  }
+};
+
 // DNBThreadStopInfo
 //
 // Describes the reason a thread stopped.
@@ -297,6 +323,10 @@ struct DNBThreadStopInfo {
       } esr_fields;
     } watchpoint;
   } details;
+
+  // When debugserver received the exception that is this thread's stop
+  // reason, if it has one.
+  DNBStopTimestamp timestamp;
 };
 
 struct DNBRegisterValue {

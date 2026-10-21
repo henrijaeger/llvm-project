@@ -103,6 +103,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Chrono.h"
@@ -1896,6 +1897,39 @@ void ProcessGDBRemote::ParseExpeditedRegisters(
   }
 }
 
+static bool IsUnsignedDecimal(llvm::StringRef str) {
+  uint64_t value;
+  return !str.empty() && llvm::all_of(str, llvm::isDigit) &&
+         !str.getAsInteger(10, value);
+}
+
+/// Stores the value of a "time" or "conttime" stop reply field. A malformed
+/// value is logged and ignored, so that it affects neither the other field
+/// nor the rest of the stop. If a field is repeated, the last valid value wins.
+static void ParseStopTimestampField(llvm::StringRef key, llvm::StringRef value,
+                                    StopTimestamps &timestamps) {
+  bool valid = false;
+  std::optional<std::string> *field = nullptr;
+  if (key == "time") {
+    // "<seconds>.<nine digits>"
+    auto [seconds, fraction] = value.split('.');
+    valid = IsUnsignedDecimal(seconds) && fraction.size() == 9 &&
+            llvm::all_of(fraction, llvm::isDigit);
+    field = &timestamps.time;
+  } else if (key == "conttime") {
+    valid = IsUnsignedDecimal(value);
+    field = &timestamps.conttime;
+  } else {
+    return;
+  }
+
+  if (valid)
+    *field = value.str();
+  else
+    LLDB_LOG(GetLog(GDBRLog::Process),
+             "ignoring malformed stop reply field {0}:{1}", key, value);
+}
+
 ThreadSP ProcessGDBRemote::SetThreadStopInfo(
     lldb::tid_t tid, ExpeditedRegisterMap &expedited_register_map,
     uint8_t signo, const std::string &thread_name, const std::string &reason,
@@ -1906,7 +1940,8 @@ ThreadSP ProcessGDBRemote::SetThreadStopInfo(
     LazyBool associated_with_dispatch_queue, addr_t dispatch_queue_t,
     std::string &queue_name, QueueKind queue_kind, uint64_t queue_serial,
     std::vector<lldb::addr_t> &added_binaries,
-    StructuredData::ObjectSP &detailed_binaries_info) {
+    StructuredData::ObjectSP &detailed_binaries_info,
+    const StopTimestamps &stop_timestamps) {
 
   if (tid == LLDB_INVALID_THREAD_ID)
     return nullptr;
@@ -2218,6 +2253,12 @@ ThreadSP ProcessGDBRemote::SetThreadStopInfo(
         }
       }
     }
+
+    // Any stop info here was created for this stop, so the timestamps belong
+    // to it. A stop info kept from an earlier stop (above) keeps its own.
+    if (!stop_timestamps.empty())
+      if (StopInfoSP stop_info_sp = thread_sp->GetPrivateStopInfo(false))
+        stop_info_sp->SetStopTimestamps(stop_timestamps);
   }
   return thread_sp;
 }
@@ -2281,6 +2322,7 @@ ProcessGDBRemote::SetThreadStopInfo(StructuredData::Dictionary *thread_dict) {
   uint64_t queue_serial_number = 0;
   std::vector<addr_t> added_binaries;
   StructuredData::ObjectSP detailed_binaries_info;
+  StopTimestamps stop_timestamps;
   // Iterate through all of the thread dictionary key/value pairs from the
   // structured data dictionary
 
@@ -2290,7 +2332,8 @@ ProcessGDBRemote::SetThreadStopInfo(StructuredData::Dictionary *thread_dict) {
                         &thread_dispatch_qaddr, &queue_vars_valid,
                         &associated_with_dispatch_queue, &dispatch_queue_t,
                         &queue_name, &queue_kind, &queue_serial_number,
-                        &added_binaries, &detailed_binaries_info](
+                        &added_binaries, &detailed_binaries_info,
+                        &stop_timestamps](
                            llvm::StringRef key,
                            StructuredData::Object *object) -> bool {
     if (key == g_key_tid) {
@@ -2344,6 +2387,9 @@ ProcessGDBRemote::SetThreadStopInfo(StructuredData::Dictionary *thread_dict) {
       reason = std::string(object->GetStringValue());
     } else if (key == g_key_description) {
       description = std::string(object->GetStringValue());
+    } else if (key == "time" || key == "conttime") {
+      // Sent as strings; anything else is malformed.
+      ParseStopTimestampField(key, object->GetStringValue(), stop_timestamps);
     } else if (key == g_key_registers) {
       StructuredData::Dictionary *registers_dict = object->GetAsDictionary();
 
@@ -2424,7 +2470,8 @@ ProcessGDBRemote::SetThreadStopInfo(StructuredData::Dictionary *thread_dict) {
       tid, expedited_register_map, signo, thread_name, reason, description,
       exc_type, exc_data, thread_dispatch_qaddr, queue_vars_valid,
       associated_with_dispatch_queue, dispatch_queue_t, queue_name, queue_kind,
-      queue_serial_number, added_binaries, detailed_binaries_info);
+      queue_serial_number, added_binaries, detailed_binaries_info,
+      stop_timestamps);
 }
 
 StateType ProcessGDBRemote::SetThreadStopInfo(StringExtractor &stop_packet) {
@@ -2470,8 +2517,11 @@ StateType ProcessGDBRemote::SetThreadStopInfo(StringExtractor &stop_packet) {
     uint64_t queue_serial_number = 0;
     ExpeditedRegisterMap expedited_register_map;
     AddressableBits addressable_bits;
+    StopTimestamps stop_timestamps;
     while (stop_packet.GetNameColonValue(key, value)) {
-      if (key.compare("metype") == 0) {
+      if (key == "time" || key == "conttime") {
+        ParseStopTimestampField(key, value, stop_timestamps);
+      } else if (key.compare("metype") == 0) {
         // exception type in big endian hex
         value.getAsInteger(BASE_16, exc_type);
       } else if (key.compare("medata") == 0) {
@@ -2685,8 +2735,8 @@ StateType ProcessGDBRemote::SetThreadStopInfo(StringExtractor &stop_packet) {
         tid, expedited_register_map, signo, thread_name, reason, description,
         exc_type, exc_data, thread_dispatch_qaddr, queue_vars_valid,
         associated_with_dispatch_queue, dispatch_queue_t, queue_name,
-        queue_kind, queue_serial_number, added_binaries,
-        detailed_binaries_info);
+        queue_kind, queue_serial_number, added_binaries, detailed_binaries_info,
+        stop_timestamps);
 
     return eStateStopped;
   } break;

@@ -6,6 +6,7 @@
 
 add_lldb_unittest(debugserverTests
   JSONTest.cpp
+  MachExceptionTest.cpp
   RNBSocketTest.cpp
   debugserver_LogCallback.cpp
 
@@ -31,6 +32,7 @@ if(APPLE_EMBEDDED)
 
   add_lldb_unittest(debugserverNonUITests
     JSONTest.cpp
+    MachExceptionTest.cpp
     RNBSocketTest.cpp
     debugserver_LogCallback.cpp
 
