@@ -11,13 +11,19 @@
 #include "DNBDefs.h"
 #include "MachException.h"
 
+#include <mach/mach_error.h>
 #include <mach/mach_time.h>
+#include <mach/mig_errors.h>
+#include <unistd.h>
 
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <limits>
+#include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -67,72 +73,141 @@ MachException::Data MakeException(exception_type_t type,
 std::deque<DNBStopTimestamp> g_samples;
 
 DNBStopTimestamp NextSample() {
+  if (g_samples.empty()) {
+    ADD_FAILURE() << "received more messages than the test has samples for";
+    return {};
+  }
   DNBStopTimestamp sample = g_samples.front();
   g_samples.pop_front();
   return sample;
 }
 
-// A port with a receive and a send right. Exception messages arrive on one;
-// others stand in for the task and thread ports the kernel would send, which
-// a process may not put in a message itself.
-class Port {
-public:
-  Port() {
-    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &m_port);
-    mach_port_insert_right(mach_task_self(), m_port, m_port,
-                           MACH_MSG_TYPE_MAKE_SEND);
-  }
-  ~Port() {
-    mach_port_deallocate(mach_task_self(), m_port);
-    mach_port_mod_refs(mach_task_self(), m_port, MACH_PORT_RIGHT_RECEIVE, -1);
-  }
-  mach_port_t Get() const { return m_port; }
-
-  // Receives the next message the way the exception thread does, and
-  // decodes it for task.
-  MachException::Message Receive(task_t task) {
-    MachException::Message message;
-    EXPECT_EQ(message.Receive(m_port, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 5000,
-                              MACH_PORT_NULL, NextSample),
-              KERN_SUCCESS);
-    EXPECT_TRUE(message.CatchExceptionRaise(task));
-    return message;
-  }
-
-private:
-  mach_port_t m_port = MACH_PORT_NULL;
-};
-
-// Sends an exception message from another thread and waits for the reply,
-// like a thread that raised an exception.
-class RaisingThread {
-public:
-  RaisingThread(mach_port_t port, mach_port_t thread, mach_port_t task,
-                exception_type_t type,
-                std::vector<mach_exception_data_type_t> code)
-      : m_thread([this, port, thread, task, type, code]() mutable {
-          m_result = mach_exception_raise(port, thread, task, type, code.data(),
-                                          code.size());
-        }) {}
-  ~RaisingThread() {
-    if (m_thread.joinable())
-      m_thread.join();
-  }
-  kern_return_t Join() {
-    m_thread.join();
-    return m_result;
-  }
-
-private:
-  kern_return_t m_result = KERN_FAILURE;
-  std::thread m_thread;
-};
-
-void Reply(MachException::Message &message) {
-  mach_msg(&message.reply_msg.hdr, MACH_SEND_MSG,
-           message.reply_msg.hdr.msgh_size, 0, MACH_PORT_NULL,
-           MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+std::string Describe(kern_return_t kr) {
+  return std::string(mach_error_string(kr)) + " (" + std::to_string(kr) + ")";
 }
+
+// Receives exception messages that helper threads send, as debugserver
+// receives the kernel's. The threads wait for replies, so whatever a test
+// does, the destructor first releases every request that was not answered
+// and only then waits for the threads.
+class ExceptionServer {
+public:
+  // results, if given, receives what each sender's mach_exception_raise()
+  // returned, in the order they were raised.
+  explicit ExceptionServer(std::vector<kern_return_t> *results = nullptr)
+      : m_results(results) {
+    m_port = NewPort();
+  }
+
+  ~ExceptionServer() {
+    std::vector<kern_return_t> results = Shutdown();
+    if (m_results)
+      *m_results = std::move(results);
+  }
+
+  // The port the server receives on.
+  mach_port_t ReceivePort() const { return m_port; }
+
+  // A port with a receive and a send right. Besides the one messages arrive
+  // on, these stand in for the task and thread ports the kernel would send,
+  // which a process may not put in a message itself.
+  mach_port_t NewPort() {
+    mach_port_t port = MACH_PORT_NULL;
+    kern_return_t kr =
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+    EXPECT_EQ(kr, KERN_SUCCESS) << "mach_port_allocate: " << Describe(kr);
+    if (kr != KERN_SUCCESS)
+      return MACH_PORT_NULL;
+    m_ports.push_back(port);
+    kr = mach_port_insert_right(mach_task_self(), port, port,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    EXPECT_EQ(kr, KERN_SUCCESS) << "mach_port_insert_right: " << Describe(kr);
+    return port;
+  }
+
+  // Sends an exception message from a new thread, which waits for a reply
+  // the way a thread that raised an exception does.
+  void Raise(mach_port_t thread, mach_port_t task, exception_type_t type,
+             std::vector<mach_exception_data_type_t> code) {
+    auto sender = std::make_unique<Sender>();
+    Sender *s = sender.get();
+    const mach_port_t port = m_port;
+    s->thread = std::thread([s, port, thread, task, type, code]() mutable {
+      s->result = mach_exception_raise(port, thread, task, type, code.data(),
+                                       code.size());
+    });
+    m_senders.push_back(std::move(sender));
+  }
+
+  // Receives the next message within timeout_ms and decodes it for task.
+  // Nothing is decoded if nothing was received, and a message that is not an
+  // exception request is destroyed instead.
+  testing::AssertionResult Receive(task_t task, MachException::Message &message,
+                                   mach_msg_timeout_t timeout_ms = 5000) {
+    kern_return_t kr = message.Receive(m_port, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                       timeout_ms, MACH_PORT_NULL, NextSample);
+    if (kr != KERN_SUCCESS)
+      return testing::AssertionFailure() << "receive: " << Describe(kr);
+    if (!message.CatchExceptionRaise(task)) {
+      const mach_msg_id_t id = message.exc_msg.hdr.msgh_id;
+      mach_msg_destroy(&message.exc_msg.hdr);
+      return testing::AssertionFailure()
+             << "message " << id << " is not an exception request";
+    }
+    m_unanswered.insert(message.reply_msg.hdr.msgh_remote_port);
+    return testing::AssertionSuccess();
+  }
+
+  // Sends the reply that the decoded message's sender is waiting for.
+  testing::AssertionResult Reply(MachException::Message &message) {
+    const mach_port_t reply_port = message.reply_msg.hdr.msgh_remote_port;
+    if (!m_unanswered.count(reply_port))
+      return testing::AssertionFailure() << "no request waits for this reply";
+    kern_return_t kr =
+        mach_msg(&message.reply_msg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                 message.reply_msg.hdr.msgh_size, 0, MACH_PORT_NULL, 5000,
+                 MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS)
+      return testing::AssertionFailure() << "reply: " << Describe(kr);
+    m_unanswered.erase(reply_port);
+    return testing::AssertionSuccess();
+  }
+
+  // Releases every request that was not answered and waits for all senders.
+  // A released sender gets MIG_SERVER_DIED. Returns their results in the
+  // order they were raised.
+  std::vector<kern_return_t> Shutdown() {
+    // Dropping the reply right of a received request wakes its sender.
+    for (mach_port_t reply_port : m_unanswered)
+      mach_port_deallocate(mach_task_self(), reply_port);
+    m_unanswered.clear();
+    // Destroying the ports discards requests still queued, which wakes
+    // their senders too.
+    for (mach_port_t port : m_ports)
+      mach_port_destroy(mach_task_self(), port);
+    m_ports.clear();
+    std::vector<kern_return_t> results;
+    for (std::unique_ptr<Sender> &sender : m_senders) {
+      if (sender->thread.joinable())
+        sender->thread.join();
+      results.push_back(sender->result);
+    }
+    m_senders.clear();
+    return results;
+  }
+
+private:
+  struct Sender {
+    std::thread thread;
+    kern_return_t result = KERN_FAILURE;
+  };
+
+  std::vector<kern_return_t> *m_results;
+  mach_port_t m_port = MACH_PORT_NULL;
+  std::vector<mach_port_t> m_ports;
+  std::set<mach_port_t> m_unanswered;
+  std::vector<std::unique_ptr<Sender>> m_senders;
+};
 
 } // namespace
 
@@ -201,22 +276,30 @@ TEST(MachExceptionClocks, WallTimeIsNotCorrected) {
 }
 
 TEST(MachExceptionClocks, SamplesThisHostsClocks) {
-  struct timespec before_wall, after_wall;
-  ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &before_wall), 0);
-  const uint64_t before_continuous = mach_continuous_time();
-  DNBStopTimestamp timestamp = MachException::SampleStopTimestamp();
-  const uint64_t after_continuous = mach_continuous_time();
-  ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &after_wall), 0);
+  // The same availability check as SampleStopTimestamp(). Without the
+  // clocks, it reports neither.
+  if (__builtin_available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)) {
+    struct timespec before_wall, after_wall;
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &before_wall), 0);
+    const uint64_t before_continuous = mach_continuous_time();
+    DNBStopTimestamp timestamp = MachException::SampleStopTimestamp();
+    const uint64_t after_continuous = mach_continuous_time();
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &after_wall), 0);
 
-  ASSERT_TRUE(timestamp.has_continuous_time);
-  EXPECT_LE(before_continuous, timestamp.continuous_time);
-  EXPECT_LE(timestamp.continuous_time, after_continuous);
-  ASSERT_TRUE(timestamp.has_wall_time);
-  auto ns = [](const struct timespec &ts) {
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
-  };
-  EXPECT_LE(ns(before_wall), ns(timestamp.wall_time));
-  EXPECT_LE(ns(timestamp.wall_time), ns(after_wall));
+    ASSERT_TRUE(timestamp.has_continuous_time);
+    EXPECT_LE(before_continuous, timestamp.continuous_time);
+    EXPECT_LE(timestamp.continuous_time, after_continuous);
+    ASSERT_TRUE(timestamp.has_wall_time);
+    auto ns = [](const struct timespec &ts) {
+      return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+    };
+    EXPECT_LE(ns(before_wall), ns(timestamp.wall_time));
+    EXPECT_LE(ns(timestamp.wall_time), ns(after_wall));
+  } else {
+    DNBStopTimestamp timestamp = MachException::SampleStopTimestamp();
+    EXPECT_FALSE(timestamp.has_wall_time);
+    EXPECT_FALSE(timestamp.has_continuous_time);
+  }
 }
 
 TEST(MachExceptionData, StopInfoCarriesTheExceptionsTimestamp) {
@@ -293,16 +376,15 @@ TEST(MachExceptionMessage, EachMessageInABundleKeepsItsOwnSample) {
   const DNBStopTimestamp second = MakeTimestamp(2000, 2000, 1111);
   g_samples = {first, second};
 
-  Port port, task, thread_a_port, thread_b_port;
-  RaisingThread thread_a(port.Get(), thread_a_port.Get(), task.Get(),
-                         EXC_BREAKPOINT, {1, 0x1000});
-  RaisingThread thread_b(port.Get(), thread_b_port.Get(), task.Get(),
-                         EXC_BREAKPOINT, {1, 0x2000});
+  ExceptionServer server;
+  const mach_port_t task = server.NewPort();
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x1000});
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x2000});
 
   // Both are received before either is answered, as one bundle.
-  MachException::Message::collection bundle;
-  bundle.push_back(port.Receive(task.Get()));
-  bundle.push_back(port.Receive(task.Get()));
+  MachException::Message::collection bundle(2);
+  ASSERT_TRUE(server.Receive(task, bundle[0]));
+  ASSERT_TRUE(server.Receive(task, bundle[1]));
 
   ASSERT_TRUE(bundle[0].state.IsValid());
   ASSERT_TRUE(bundle[1].state.IsValid());
@@ -317,9 +399,9 @@ TEST(MachExceptionMessage, EachMessageInABundleKeepsItsOwnSample) {
   ExpectSameTimestamp(stop_info.timestamp, second);
 
   for (MachException::Message &message : bundle)
-    Reply(message);
-  EXPECT_EQ(thread_a.Join(), KERN_SUCCESS);
-  EXPECT_EQ(thread_b.Join(), KERN_SUCCESS);
+    EXPECT_TRUE(server.Reply(message));
+  EXPECT_EQ(server.Shutdown(),
+            std::vector<kern_return_t>({KERN_SUCCESS, KERN_SUCCESS}));
 }
 
 TEST(MachExceptionMessage, RejectedMessageChangesNothing) {
@@ -327,17 +409,18 @@ TEST(MachExceptionMessage, RejectedMessageChangesNothing) {
   const DNBStopTimestamp rejected_sample = MakeTimestamp(2000, 2000, 2222);
   g_samples = {accepted_sample, rejected_sample};
 
-  Port port, task, thread_a_port, thread_b_port;
-  RaisingThread ours(port.Get(), thread_a_port.Get(), task.Get(),
-                     EXC_BREAKPOINT, {1, 0x1000});
-  MachException::Message accepted = port.Receive(task.Get());
+  ExceptionServer server;
+  const mach_port_t task = server.NewPort();
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x1000});
+  MachException::Message accepted;
+  ASSERT_TRUE(server.Receive(task, accepted));
 
   // A message for a task other than the one being debugged is decoded but
   // not accepted. (That task must be real: the mismatch is checked with
   // task_info().)
-  RaisingThread theirs(port.Get(), thread_b_port.Get(), task.Get(),
-                       EXC_BREAKPOINT, {1, 0x2000});
-  MachException::Message rejected = port.Receive(mach_task_self());
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x2000});
+  MachException::Message rejected;
+  ASSERT_TRUE(server.Receive(mach_task_self(), rejected));
   EXPECT_FALSE(rejected.state.IsValid());
 
   ExpectSameTimestamp(accepted.state.timestamp, accepted_sample);
@@ -348,8 +431,85 @@ TEST(MachExceptionMessage, RejectedMessageChangesNothing) {
   EXPECT_FALSE(stop_info.timestamp.has_wall_time);
   EXPECT_FALSE(stop_info.timestamp.has_continuous_time);
 
-  Reply(accepted);
-  Reply(rejected);
-  EXPECT_EQ(ours.Join(), KERN_SUCCESS);
-  EXPECT_NE(theirs.Join(), KERN_SUCCESS);
+  EXPECT_TRUE(server.Reply(accepted));
+  EXPECT_TRUE(server.Reply(rejected));
+  std::vector<kern_return_t> results = server.Shutdown();
+  ASSERT_EQ(results.size(), 2u);
+  EXPECT_EQ(results[0], KERN_SUCCESS);
+  EXPECT_NE(results[1], KERN_SUCCESS);
+}
+
+TEST(ExceptionServer, NothingReceivedNothingDecoded) {
+  g_samples = {MakeTimestamp(1, 0, 1)};
+  ExceptionServer server;
+  MachException::Message message;
+  testing::AssertionResult received =
+      server.Receive(server.NewPort(), message, /*timeout_ms=*/10);
+  EXPECT_FALSE(received);
+  EXPECT_NE(std::string(received.message()).find("receive:"), std::string::npos)
+      << received.message();
+  // The clocks were not read and nothing was decoded.
+  EXPECT_EQ(g_samples.size(), 1u);
+  EXPECT_FALSE(message.state.IsValid());
+  EXPECT_FALSE(message.state.timestamp.has_continuous_time);
+}
+
+TEST(ExceptionServer, OtherMessagesAreNotDecoded) {
+  g_samples = {MakeTimestamp(1, 0, 1)};
+  ExceptionServer server;
+  mach_msg_header_t header = {};
+  header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+  header.msgh_size = sizeof(header);
+  header.msgh_remote_port = server.ReceivePort();
+  header.msgh_id = 1234;
+  ASSERT_EQ(mach_msg(&header, MACH_SEND_MSG, sizeof(header), 0, MACH_PORT_NULL,
+                     MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL),
+            KERN_SUCCESS);
+
+  MachException::Message message;
+  testing::AssertionResult received = server.Receive(server.NewPort(), message);
+  EXPECT_FALSE(received);
+  EXPECT_NE(std::string(received.message()).find("not an exception request"),
+            std::string::npos)
+      << received.message();
+  EXPECT_FALSE(message.state.IsValid());
+}
+
+namespace {
+// What a failing test leaves behind: one request received and not answered,
+// and one still queued, when a fatal assertion returns.
+void ReturnEarlyWithRequestsOutstanding(std::vector<kern_return_t> &results,
+                                        bool &returned_early) {
+  g_samples = {MakeTimestamp(1, 0, 1), MakeTimestamp(2, 0, 2)};
+  ExceptionServer server(&results);
+  const mach_port_t task = server.NewPort();
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x1000});
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x2000});
+  MachException::Message received;
+  ASSERT_TRUE(server.Receive(task, received));
+  returned_early = true;
+  ASSERT_TRUE(false) << "injected early return";
+  returned_early = false;
+}
+} // namespace
+
+TEST(ExceptionServer, EarlyReturnReleasesEveryRequest) {
+  // Cleanup runs in a child process that must finish within the bound; a
+  // hang ends it with SIGALRM, which fails this test.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        alarm(10);
+        std::vector<kern_return_t> results;
+        bool returned_early = false;
+        ReturnEarlyWithRequestsOutstanding(results, returned_early);
+        fprintf(stderr, "returned early: %d, senders:", returned_early);
+        for (kern_return_t result : results)
+          fprintf(stderr, " %d", result);
+        fprintf(stderr, "\n");
+        std::_Exit(0);
+      },
+      testing::ExitedWithCode(0),
+      "returned early: 1, senders: " + std::to_string(MIG_SERVER_DIED) + " " +
+          std::to_string(MIG_SERVER_DIED) + "\n");
 }

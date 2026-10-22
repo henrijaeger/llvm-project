@@ -2525,7 +2525,10 @@ following keys and values:
 
   lldb takes a thread's values from the reply that first describes its stop
   (the stop reply, `jstopinfo`, `qThreadStopInfo` or `jThreadsInfo`); later
-  replies about the same stop do not add or change them. It ignores a malformed
+  replies about the same stop do not add or change them, so a value that only
+  a later reply carries is not reported. lldb cannot tell a stop it keeps from
+  an earlier event from one made for this event, and would otherwise risk
+  mixing the two. It ignores a malformed
   value without affecting the other value or the stop, and uses the last valid
   value of a repeated key. A thread that keeps its earlier stop keeps that
   stop's values, and a completed step has the values of the stop that completed

@@ -21,16 +21,20 @@ import side_effect
 class TestDebugserverStopTimestamps(TestBase):
     NO_DEBUG_INFO_TESTCASE = True
 
+    def setUp(self):
+        TestBase.setUp(self)
+        # Every test here relies on debugserver reading mach_continuous_time().
+        # Failing to load libSystem at all is an error, not a reason to skip.
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        try:
+            self._mach_continuous_time = libsystem.mach_continuous_time
+        except AttributeError:
+            self.skipTest("mach_continuous_time() is not available")
+        self._mach_continuous_time.restype = ctypes.c_uint64
+
     def host_clocks(self):
         """(wall time in ns, continuous time) on this host. The target runs on
         this host too, so its stops lie between two such readings."""
-        if not hasattr(self, "_mach_continuous_time"):
-            libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-            try:
-                self._mach_continuous_time = libsystem.mach_continuous_time
-            except AttributeError:
-                self.skipTest("mach_continuous_time() is not available")
-            self._mach_continuous_time.restype = ctypes.c_uint64
         return time.time_ns(), self._mach_continuous_time()
 
     def stop_timestamp(self, thread):

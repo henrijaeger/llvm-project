@@ -230,16 +230,19 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
     @skipIfXmlSupportMissing
     def test_later_replies_do_not_change_a_stop(self):
         # The reply that creates a thread's stop decides its timestamps. A
-        # later reply about the same stop does not add, replace or remove them.
+        # later reply about the same stop does not add, replace or remove them,
+        # even when it is the only one that has them.
         responder = StopResponder(
             [
-                "T02thread:1;threads:1,2,3;",
+                "T02thread:1;threads:1,2,3,4;",
                 # Thread 1: only a wall time.
-                "T02thread:1;threads:1,2,3;time:1.000000001;"
+                "T02thread:1;threads:1,2,3,4;time:1.000000001;"
                 + jstopinfo(
                     thread_info(1, "1.000000001", "100"),
                     thread_info(2, "2.000000002", "200"),
                     thread_info(3, "3.000000003", "300"),
+                    # Thread 4: neither.
+                    thread_info(4),
                 ),
             ],
             # Read at the public stop after the resume.
@@ -252,6 +255,8 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
                     thread_info(2, "7.000000007", "700"),
                     # Omits both fields.
                     thread_info(3),
+                    # Has both, but too late.
+                    thread_info(4, "4.000000004", "400"),
                 ],
             },
         )
@@ -271,6 +276,9 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
             self.stop_timestamps(process.GetThreadByID(3)),
             {"time": "3.000000003", "conttime": "300"},
         )
+        thread_4 = process.GetThreadByID(4)
+        self.assertStopReason(thread_4.GetStopReason(), lldb.eStopReasonSignal)
+        self.assertIsNone(self.stop_timestamps(thread_4))
 
     @skipIfXmlSupportMissing
     def test_malformed_values_are_ignored_one_by_one(self):
