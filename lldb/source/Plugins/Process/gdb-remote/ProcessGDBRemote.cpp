@@ -2255,7 +2255,9 @@ ThreadSP ProcessGDBRemote::SetThreadStopInfo(
     }
 
     // Any stop info here was created for this stop, so the timestamps belong
-    // to it. A stop info kept from an earlier stop (above) keeps its own.
+    // to it. Later replies about the same stop (jThreadsInfo, say) do not add
+    // to or replace them: by then a stop info kept from an earlier stop looks
+    // just as current as a new one, and the two must not be mixed.
     if (!stop_timestamps.empty())
       if (StopInfoSP stop_info_sp = thread_sp->GetPrivateStopInfo(false))
         stop_info_sp->SetStopTimestamps(stop_timestamps);

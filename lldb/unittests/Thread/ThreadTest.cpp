@@ -26,6 +26,8 @@
 #include "lldb/Target/StopInfo.h"
 #include "lldb/Target/ThreadPlanBase.h"
 #include "lldb/Utility/ArchSpec.h"
+#include "lldb/Utility/StreamString.h"
+#include "lldb/Utility/StructuredData.h"
 #include "gtest/gtest.h"
 
 using namespace lldb_private;
@@ -107,6 +109,7 @@ public:
 
   bool IsStillAtLastBreakpointHit() override { return true; }
 
+  using Thread::PopPlan;
   using Thread::PushPlan;
 
   lldb::addr_t GetStoppedAtUnexpectedBP() const {
@@ -281,4 +284,181 @@ TEST_F(ThreadTest, ShouldResume) {
   thread_sp->SetThreadStoppedAtUnexecutedBP(unexpected_bp_addr);
   EXPECT_TRUE(thread_sp->ShouldResume(eStateSuspended));
   EXPECT_EQ(unexpected_bp_addr, thread_sp->GetStoppedAtUnexpectedBP());
+}
+
+namespace {
+// A stop info that carries extended info from its plugin.
+class ExtendedInfoStopInfo : public StopInfo {
+public:
+  ExtendedInfoStopInfo(Thread &thread, StructuredData::ObjectSP info)
+      : StopInfo(thread, 0) {
+    m_extended_info = std::move(info);
+  }
+  StopReason GetStopReason() const override { return eStopReasonException; }
+};
+
+StopTimestamps MakeStopTimestamps(std::optional<std::string> time,
+                                  std::optional<std::string> conttime) {
+  StopTimestamps timestamps;
+  timestamps.time = std::move(time);
+  timestamps.conttime = std::move(conttime);
+  return timestamps;
+}
+
+std::string ToJSON(const StructuredData::ObjectSP &object) {
+  if (!object)
+    return "<null>";
+  StreamString stream;
+  object->Dump(stream, /*pretty_print=*/false);
+  return stream.GetString().str();
+}
+
+class StopTimestampsTest : public ThreadTest {
+public:
+  void SetUp() override {
+    ThreadTest::SetUp();
+    ArchSpec arch("x86_64-pc-linux");
+    Platform::SetHostPlatform(
+        platform_linux::PlatformLinux::CreateInstance(true, &arch));
+    m_debugger_sp = Debugger::CreateInstance();
+    ASSERT_TRUE(m_debugger_sp);
+    m_target_sp = CreateTarget(m_debugger_sp, arch);
+    ASSERT_TRUE(m_target_sp);
+    ListenerSP listener_sp(Listener::MakeListener("dummy"));
+    m_process_sp = std::make_shared<DummyProcess>(m_target_sp, listener_sp);
+    m_thread_sp = std::make_shared<DummyThread>(*m_process_sp, 0);
+  }
+
+  // A plan that has just completed, as at the end of a step.
+  void CompletePlan() {
+    m_thread_sp->PushPlan(std::make_shared<DummyThreadPlan>(*m_thread_sp));
+    m_thread_sp->PopPlan();
+    ASSERT_TRUE(m_thread_sp->GetCompletedPlan());
+  }
+
+  DebuggerSP m_debugger_sp;
+  TargetSP m_target_sp;
+  std::shared_ptr<DummyProcess> m_process_sp;
+  std::shared_ptr<DummyThread> m_thread_sp;
+};
+} // namespace
+
+TEST_F(StopTimestampsTest, ExtendedInfoWithoutOtherInfo) {
+  StopInfoSP stop_info_sp =
+      StopInfo::CreateStopReasonWithSignal(*m_thread_sp, 2);
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            "<null>");
+
+  stop_info_sp->SetStopTimestamps(
+      MakeStopTimestamps("1.000000001", "18446744073709551615"));
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"18446744073709551615","time":"1.000000001"})");
+  // Asking again gives the same answer.
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"18446744073709551615","time":"1.000000001"})");
+
+  stop_info_sp->SetStopTimestamps(MakeStopTimestamps(std::nullopt, "7"));
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"7"})");
+
+  // The plugin's own extended info stays empty.
+  EXPECT_FALSE(stop_info_sp->GetExtendedInfo());
+}
+
+TEST_F(StopTimestampsTest, ExistingEntriesAreKeptAndNotModified) {
+  auto info_sp = std::make_shared<StructuredData::Dictionary>();
+  info_sp->AddStringItem("issue", "heap-use-after-free");
+  info_sp->AddIntegerItem("time", 42);
+  StopInfoSP stop_info_sp =
+      std::make_shared<ExtendedInfoStopInfo>(*m_thread_sp, info_sp);
+  stop_info_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "7"));
+
+  // An existing "time" wins, even with another type.
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"7","issue":"heap-use-after-free","time":42})");
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfo()),
+            R"({"issue":"heap-use-after-free","time":42})");
+}
+
+TEST_F(StopTimestampsTest, OtherShapesAreReturnedAsTheyAre) {
+  auto info_sp = std::make_shared<StructuredData::Array>();
+  info_sp->AddStringItem("report");
+  StopInfoSP stop_info_sp =
+      std::make_shared<ExtendedInfoStopInfo>(*m_thread_sp, info_sp);
+  stop_info_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "7"));
+
+  EXPECT_EQ(stop_info_sp->GetExtendedInfoWithStopTimestamps(), info_sp);
+  EXPECT_EQ(ToJSON(info_sp), R"(["report"])");
+}
+
+TEST_F(StopTimestampsTest, ReturnedInfoIsASnapshot) {
+  StopInfoSP stop_info_sp =
+      StopInfo::CreateStopReasonWithSignal(*m_thread_sp, 2);
+  stop_info_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "100"));
+  StructuredData::ObjectSP before =
+      stop_info_sp->GetExtendedInfoWithStopTimestamps();
+
+  stop_info_sp->SetStopTimestamps(MakeStopTimestamps("2.000000002", "200"));
+  EXPECT_EQ(ToJSON(before), R"({"conttime":"100","time":"1.000000001"})");
+  EXPECT_EQ(ToJSON(stop_info_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"200","time":"2.000000002"})");
+}
+
+TEST_F(StopTimestampsTest, CompletedStepReportsTheStopThatCompletedIt) {
+  // An instruction step: the private stop is a trace, and the public stop
+  // info is made from the completed plan on request.
+  StopInfoSP trace_sp = StopInfo::CreateStopReasonToTrace(*m_thread_sp);
+  trace_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "100"));
+  m_thread_sp->SetStopInfo(trace_sp);
+  CompletePlan();
+
+  StopInfoSP public_sp = m_thread_sp->GetStopInfo();
+  ASSERT_TRUE(public_sp);
+  EXPECT_EQ(public_sp->GetStopReason(), eStopReasonPlanComplete);
+  EXPECT_EQ(ToJSON(public_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"100","time":"1.000000001"})");
+}
+
+TEST_F(StopTimestampsTest, PublicStopInfoKeepsTheStopsTimestamps) {
+  // A step that ends at one of its own breakpoints: the private stop info is
+  // replaced by CalculatePublicStopInfo.
+  StopInfoSP breakpoint_sp =
+      StopInfo::CreateStopReasonWithBreakpointSiteID(*m_thread_sp, 0);
+  breakpoint_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "100"));
+  m_thread_sp->SetStopInfo(breakpoint_sp);
+  CompletePlan();
+
+  m_thread_sp->CalculatePublicStopInfo();
+  StopInfoSP public_sp = m_thread_sp->GetStopInfo();
+  ASSERT_TRUE(public_sp);
+  EXPECT_EQ(public_sp->GetStopReason(), eStopReasonPlanComplete);
+  EXPECT_EQ(ToJSON(public_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"100","time":"1.000000001"})");
+}
+
+TEST_F(StopTimestampsTest, CompletedPlanDoesNotTakeAnEarlierStopsTime) {
+  StopInfoSP trace_sp = StopInfo::CreateStopReasonToTrace(*m_thread_sp);
+  trace_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "100"));
+  m_thread_sp->SetStopInfo(trace_sp);
+  m_process_sp->GetModIDNonConstRef().BumpStopID();
+  CompletePlan();
+
+  StopInfoSP public_sp = m_thread_sp->GetStopInfo();
+  ASSERT_TRUE(public_sp);
+  EXPECT_EQ(public_sp->GetStopReason(), eStopReasonPlanComplete);
+  EXPECT_EQ(ToJSON(public_sp->GetExtendedInfoWithStopTimestamps()), "<null>");
+}
+
+TEST_F(StopTimestampsTest, KeptStopKeepsItsTimestamps) {
+  StopInfoSP breakpoint_sp =
+      StopInfo::CreateStopReasonWithBreakpointSiteID(*m_thread_sp, 0);
+  breakpoint_sp->SetStopTimestamps(MakeStopTimestamps("1.000000001", "100"));
+  m_thread_sp->SetStopInfo(breakpoint_sp);
+
+  // The thread is still at the breakpoint it hit, so it keeps that stop.
+  m_process_sp->GetModIDNonConstRef().BumpStopID();
+  StopInfoSP kept_sp = m_thread_sp->GetPrivateStopInfo();
+  EXPECT_EQ(kept_sp, breakpoint_sp);
+  EXPECT_EQ(ToJSON(kept_sp->GetExtendedInfoWithStopTimestamps()),
+            R"({"conttime":"100","time":"1.000000001"})");
 }

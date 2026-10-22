@@ -2498,34 +2498,42 @@ following keys and values:
   addressing, base 10.  AArch64 can have different page table setups for low and
   high memory, and therefore a different number of bits used for addressing.
 * `time` - `string` (optional) -
-  When the stub learned of the event that is this thread's stop reason, as
+  When the stub received the event that is this thread's stop reason, as
   wall-clock time: decimal seconds since the Unix epoch, a `.`, and exactly
-  nine decimal digits of fraction, e.g. `time:1729500000.123456000;`. The
-  number of digits is fixed and says nothing about the clock's resolution.
-  debugserver reads `CLOCK_REALTIME` when it receives the mach exception
-  message, before it does any other work on the stop, so the value is
-  slightly later than the moment the thread stopped. That clock has
-  microsecond resolution on Darwin, so the last three digits are zero.
+  nine decimal digits of fraction, e.g. `time:1729500000.123456000;`.
+  debugserver reads `CLOCK_REALTIME` as soon as it has received the mach
+  exception message, before it does any other work on it. That is after the
+  thread stopped, by however long the kernel and the scheduler took to deliver
+  the message; no bound on that delay is promised. The clock has microsecond
+  resolution on Darwin, so the last three digits are zero: the number of digits
+  is fixed, and says nothing about resolution or accuracy.
 * `conttime` - `unsigned` (optional) -
-  The same event as `time`, as a base 10 reading of the target's continuous
-  clock, in that clock's ticks. debugserver reports `mach_continuous_time()`,
-  the clock unified logging stamps its events with (`machTimestamp` in
-  `log show --style ndjson`). Converting ticks to seconds needs the timebase
-  of the machine the stub runs on (`mach_timebase_info()` there), which may
-  differ from the debugger's. A reading is only comparable with readings
+  The same event as `time`, as a base 10 reading of the continuous clock of the
+  machine the stub runs on, in that clock's ticks. debugserver reports
+  `mach_continuous_time()`, the clock unified logging stamps its events with
+  (`machTimestamp` in `log show --style ndjson` on that machine). Converting
+  ticks to seconds needs that machine's timebase (`mach_timebase_info()` there),
+  which need not be the debugger's. Readings are only comparable with readings
   from the same machine and boot.
 
   The stub reads the two clocks one after the other, so they describe nearly,
-  but not exactly, the same instant. It sends each one only when it has it.
-  Both describe the event the stub reports as the thread's stop reason: if a
-  thread received several exceptions before stopping, they belong to that
-  one. A thread without a stop reason, including one that did not run since
-  the previous stop, has neither key. lldb ignores a malformed value, keeps a
-  thread's earlier time when it keeps that thread's earlier stop, and reports
-  the values as the strings `time` and `conttime` through
-  `SBThread::GetStopReasonExtendedInfoAsJSON()`. For a completed step they
-  describe the stop that completed it. Clients that do not know the keys
-  ignore them.
+  but not exactly, the same instant, and sends each one only if it could read
+  it. Both describe the event the stub reports as the thread's stop reason: if
+  a thread received several exceptions before stopping, they belong to that
+  one. debugserver sends them after `thread:`, and a thread without a stop
+  reason, including one that did not run since the previous stop, has neither.
+
+  lldb takes a thread's values from the reply that first describes its stop
+  (the stop reply, `jstopinfo`, `qThreadStopInfo` or `jThreadsInfo`); later
+  replies about the same stop do not add or change them. It ignores a malformed
+  value without affecting the other value or the stop, and uses the last valid
+  value of a repeated key. A thread that keeps its earlier stop keeps that
+  stop's values, and a completed step has the values of the stop that completed
+  it. They are reported as the strings `time` and `conttime` by
+  `SBThread::GetStopReasonExtendedInfoAsJSON()` and `thread info -s`, alongside
+  any other extended stop info: an existing entry with the same name is kept,
+  and extended stop info that is not a dictionary is shown without them.
+  Clients that do not know the keys ignore them.
 * `added-binaries` when the remote stub knows that a thread has stopped
   at a binaries-loaded breakpoint notification, and it can retrieve the list
   of binaries that have just been loaded, it may send the list of base16

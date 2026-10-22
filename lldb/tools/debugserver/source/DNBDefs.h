@@ -252,7 +252,7 @@ enum DNBMemoryPermissions {
 //
 // When debugserver received the exception message that reported a stop. The
 // clocks are read one after the other, so the two values describe nearly, but
-// not exactly, the same instant. Either one may be unavailable.
+// not exactly, the same instant. Each one may be unavailable on its own.
 struct DNBStopTimestamp {
   // CLOCK_REALTIME. Darwin reports it with microsecond resolution.
   bool has_wall_time;
@@ -270,6 +270,22 @@ struct DNBStopTimestamp {
              static_cast<unsigned long long>(wall_time.tv_sec),
              static_cast<long>(wall_time.tv_nsec));
     return buf;
+  }
+
+  // The continuous time as a decimal integer.
+  std::string ContinuousTimeString() const {
+    return std::to_string(continuous_time);
+  }
+
+  // The "time:" and "conttime:" stop reply fields for the clocks that are
+  // available.
+  std::string StopReplyFields() const {
+    std::string fields;
+    if (has_wall_time)
+      fields += "time:" + WallTimeString() + ";";
+    if (has_continuous_time)
+      fields += "conttime:" + ContinuousTimeString() + ";";
+    return fields;
   }
 };
 

@@ -172,12 +172,14 @@ bool MachException::Data::GetStopInfo(
     struct DNBThreadStopInfo *stop_info) const {
   // Zero out the structure.
   memset(stop_info, 0, sizeof(struct DNBThreadStopInfo));
-  stop_info->timestamp = timestamp;
 
   if (exc_type == 0) {
     stop_info->reason = eStopTypeInvalid;
     return true;
   }
+
+  // Only an accepted exception has a time to report.
+  stop_info->timestamp = timestamp;
 
 #if defined(__arm64__) || defined(__aarch64__)
   if (exc_type == EXC_BREAKPOINT && exc_data[0] == EXC_ARM_DA_DEBUG &&
@@ -254,24 +256,34 @@ void MachException::Data::DumpStopReason() const {
   DNBLog("%s", Name(exc_type));
 }
 
-// Reads the clocks for a stop. Continuous time is read first, then wall time,
-// so the two are close to, but not exactly, the same instant.
-static DNBStopTimestamp SampleStopTimestamp() {
+DNBStopTimestamp
+MachException::MakeStopTimestamp(uint64_t continuous_time, int realtime_status,
+                                 const struct timespec &realtime) {
   DNBStopTimestamp timestamp = {};
-  if (__builtin_available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)) {
-    timestamp.continuous_time = mach_continuous_time();
-    timestamp.has_continuous_time = true;
-    timestamp.has_wall_time =
-        clock_gettime(CLOCK_REALTIME, &timestamp.wall_time) == 0 &&
-        timestamp.wall_time.tv_sec >= 0;
+  timestamp.has_continuous_time = true;
+  timestamp.continuous_time = continuous_time;
+  if (realtime_status == 0 && realtime.tv_sec >= 0 && realtime.tv_nsec >= 0 &&
+      realtime.tv_nsec < 1000000000) {
+    timestamp.has_wall_time = true;
+    timestamp.wall_time = realtime;
   }
   return timestamp;
 }
 
-kern_return_t MachException::Message::Receive(mach_port_t port,
-                                              mach_msg_option_t options,
-                                              mach_msg_timeout_t timeout,
-                                              mach_port_t notify_port) {
+DNBStopTimestamp MachException::SampleStopTimestamp() {
+  if (__builtin_available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)) {
+    // One clock after the other, continuous time first.
+    const uint64_t continuous_time = mach_continuous_time();
+    struct timespec realtime = {};
+    const int realtime_status = clock_gettime(CLOCK_REALTIME, &realtime);
+    return MakeStopTimestamp(continuous_time, realtime_status, realtime);
+  }
+  return {};
+}
+
+kern_return_t MachException::Message::Receive(
+    mach_port_t port, mach_msg_option_t options, mach_msg_timeout_t timeout,
+    mach_port_t notify_port, DNBStopTimestamp (*sample_clocks)()) {
   DNBError err;
   const bool log_exceptions = DNBLogCheckLogBit(LOG_EXCEPTIONS);
   mach_msg_timeout_t mach_msg_timeout =
@@ -303,7 +315,7 @@ kern_return_t MachException::Message::Receive(mach_port_t port,
   // timestamp travels with the exception data, so it is reported only for
   // the exception it belongs to, and only if that exception is accepted.
   if (err.Status() == KERN_SUCCESS)
-    state.timestamp = SampleStopTimestamp();
+    state.timestamp = sample_clocks();
 
   // Dump any errors we get
   if (log_exceptions) {

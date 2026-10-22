@@ -26,6 +26,16 @@ typedef union MachMessageTag {
 
 class MachException {
 public:
+  // Reads the clocks when an exception message arrives.
+  static DNBStopTimestamp SampleStopTimestamp();
+
+  // Turns clock readings into a timestamp. The continuous time is always
+  // kept. The wall time is kept only if clock_gettime() returned
+  // realtime_status 0 and a time at or after the epoch.
+  static DNBStopTimestamp MakeStopTimestamp(uint64_t continuous_time,
+                                            int realtime_status,
+                                            const struct timespec &realtime);
+
   struct PortInfo {
     exception_mask_t mask; // the exception mask for this device which may be a
                            // subset of EXC_MASK_ALL...
@@ -74,6 +84,14 @@ public:
       return (exc_type == EXC_BREAKPOINT ||
               ((exc_type == EXC_SOFTWARE) && exc_data[0] == 1));
     }
+    // A thread can get more than one exception before it stops, but only one
+    // is reported as the reason it stopped: a later exception replaces a
+    // breakpoint (we may have been single stepping and also gotten a signal),
+    // and nothing else is replaced. The timestamp goes with the exception.
+    void UpdateWithLaterException(const Data &exc) {
+      if (!IsValid() || IsBreakpoint())
+        *this = exc;
+    }
     void Dump() const;
     void DumpStopReason() const;
     bool GetStopInfo(struct DNBThreadStopInfo *stop_info) const;
@@ -91,9 +109,13 @@ public:
     bool CatchExceptionRaise(task_t task);
     void Dump() const;
     kern_return_t Reply(MachProcess *process, int signal);
-    kern_return_t Receive(mach_port_t receive_port, mach_msg_option_t options,
-                          mach_msg_timeout_t timeout,
-                          mach_port_t notify_port = MACH_PORT_NULL);
+    // sample_clocks reads the clocks for the received message; tests
+    // replace it to get known values.
+    kern_return_t
+    Receive(mach_port_t receive_port, mach_msg_option_t options,
+            mach_msg_timeout_t timeout,
+            mach_port_t notify_port = MACH_PORT_NULL,
+            DNBStopTimestamp (*sample_clocks)() = SampleStopTimestamp);
 
     typedef std::vector<Message> collection;
     typedef collection::iterator iterator;

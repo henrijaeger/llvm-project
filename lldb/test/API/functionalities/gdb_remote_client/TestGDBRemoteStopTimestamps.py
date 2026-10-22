@@ -1,6 +1,7 @@
 """
 Test that the "time" and "conttime" stop reply fields reach
-SBThread::GetStopReasonExtendedInfoAsJSON for the thread they describe.
+SBThread::GetStopReasonExtendedInfoAsJSON for the stop they describe, through
+each packet that can carry them.
 """
 
 import json
@@ -12,12 +13,8 @@ from lldbsuite.test.gdbclientutils import *
 from lldbsuite.test.lldbgdbclient import GDBRemoteTestBase
 
 
-def hexify(text):
-    return text.encode().hex()
-
-
 def jstopinfo(*threads):
-    return "jstopinfo:%s;" % hexify(json.dumps(list(threads)))
+    return "jstopinfo:%s;" % json.dumps(list(threads)).encode().hex()
 
 
 def thread_info(tid, time=None, conttime=None):
@@ -33,13 +30,14 @@ def thread_info(tid, time=None, conttime=None):
 class StopResponder(MockGDBServerResponder):
     """Replies to the initial "?" with stops[0] and to the n-th resume with
     stops[n]. thread_stops[n] and threads_info[n] are the qThreadStopInfo and
-    jThreadsInfo replies while stopped at stops[n]."""
+    jThreadsInfo replies while stopped at stops[n]; without them the packet is
+    unsupported."""
 
     def __init__(self, stops, thread_stops=None, threads_info=None):
         super().__init__()
         self.stops = stops
-        self.thread_stops = thread_stops or {}
-        self.threads_info = threads_info or {}
+        self.thread_stops = thread_stops
+        self.threads_info = threads_info
         self.current = 0
 
     def qXferRead(self, obj, annex, offset, length):
@@ -61,11 +59,14 @@ class StopResponder(MockGDBServerResponder):
         return self.stops[self.current]
 
     def threadStopInfo(self, threadnum):
-        return self.thread_stops.get(self.current, {}).get(threadnum, "")
+        if self.thread_stops is None:
+            return ""
+        return self.thread_stops.get(self.current, {}).get(threadnum, "E01")
 
     def jThreadsInfo(self):
-        info = self.threads_info.get(self.current)
-        return json.dumps(info) if info is not None else ""
+        if self.threads_info is None:
+            return ""
+        return escape_binary(json.dumps(self.threads_info.get(self.current, [])))
 
     def _resume(self):
         self.current += 1
@@ -87,6 +88,8 @@ class StopResponder(MockGDBServerResponder):
 
 class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
     def stop_timestamps(self, thread):
+        """The timestamp entries of the thread's stop, or None if the stop has
+        no extended info."""
         stream = lldb.SBStream()
         if not thread.GetStopReasonExtendedInfoAsJSON(stream):
             return None
@@ -101,8 +104,11 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
             self.addTearDownHook(lambda: self.runCmd("log disable gdb-remote packets"))
         return self.connect(target)
 
+    def received(self):
+        return self.server.responder.packetLog.get_received()
+
     @skipIfXmlSupportMissing
-    def test_values_keep_every_digit(self):
+    def test_text_stop_reply(self):
         process = self.connect_to(
             StopResponder(
                 [
@@ -128,6 +134,28 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
             ],
             ordered=False,
         )
+        # Timestamps are not instrumentation reports.
+        backtraces = thread.GetStopReasonExtendedBacktraces(
+            lldb.eInstrumentationRuntimeTypeAddressSanitizer
+        )
+        self.assertEqual(backtraces.GetSize(), 0)
+        self.assertNotIn("qThreadStopInfo1", self.received())
+
+    @skipIfXmlSupportMissing
+    def test_qThreadStopInfo(self):
+        process = self.connect_to(
+            StopResponder(
+                ["T02thread:1;threads:1,2;time:1.000000001;conttime:100;"],
+                thread_stops={
+                    0: {2: "T02thread:2;threads:1,2;time:2.000000002;conttime:200;"}
+                },
+            )
+        )
+        self.assertEqual(
+            self.stop_timestamps(process.GetThreadByID(2)),
+            {"time": "2.000000002", "conttime": "200"},
+        )
+        self.assertPacketLogReceived(["qThreadStopInfo2"])
 
     @skipIfXmlSupportMissing
     def test_jstopinfo(self):
@@ -136,12 +164,17 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
                 [
                     "T02thread:1;threads:1,2,3,4;time:1.000000001;conttime:100;"
                     + jstopinfo(
-                        thread_info(1, "1.000000001", "100"),
+                        # The stop reply already described thread 1.
+                        thread_info(1, "9.000000009", "900"),
                         thread_info(2, "2.000000002", "200"),
                         # A server that does not send the fields.
                         thread_info(3),
                     )
-                ]
+                ],
+                # Would give different values if lldb asked.
+                thread_stops={
+                    0: {2: "T02thread:2;threads:1,2,3,4;time:8.000000008;conttime:800;"}
+                },
             )
         )
         self.assertEqual(
@@ -159,27 +192,84 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
         thread_4 = process.GetThreadByID(4)
         self.assertStopReason(thread_4.GetStopReason(), lldb.eStopReasonNone)
         self.assertIsNone(self.stop_timestamps(thread_4))
+        self.assertNotIn("qThreadStopInfo2", self.received())
 
     @skipIfXmlSupportMissing
-    def test_qThreadStopInfo(self):
-        process = self.connect_to(
-            StopResponder(
-                ["T02thread:1;threads:1,2;time:1.000000001;conttime:100;"],
-                thread_stops={
-                    0: {
-                        1: "T02thread:1;threads:1,2;time:1.000000001;conttime:100;",
-                        2: "T02thread:2;threads:1,2;time:2.000000002;conttime:200;",
-                    }
-                },
-            )
+    def test_jThreadsInfo(self):
+        # jThreadsInfo is read at the public stop. It describes a thread's stop
+        # only if nothing did before: here, thread 2, which was suspended and
+        # had no stop reason, is the only thread it is the source for.
+        responder = StopResponder(
+            [
+                "T02thread:1;threads:1,2;time:1.000000001;conttime:100;"
+                + jstopinfo(thread_info(1, "1.000000001", "100")),
+                "T02thread:1;threads:1,2;time:3.000000003;conttime:300;"
+                + jstopinfo(thread_info(1, "3.000000003", "300")),
+            ],
+            threads_info={
+                0: [thread_info(1, "1.000000001", "100")],
+                1: [
+                    thread_info(1, "3.000000003", "300"),
+                    thread_info(2, "4.000000004", "400"),
+                ],
+            },
         )
+        process = self.connect_to(responder)
+        thread_2 = process.GetThreadByID(2)
+        self.assertStopReason(thread_2.GetStopReason(), lldb.eStopReasonNone)
+
+        thread_2.Suspend()
+        self.assertSuccess(process.Continue())
+        self.assertEqual(responder.current, 1)
+        self.assertStopReason(thread_2.GetStopReason(), lldb.eStopReasonSignal)
         self.assertEqual(
-            self.stop_timestamps(process.GetThreadByID(1)),
-            {"time": "1.000000001", "conttime": "100"},
+            self.stop_timestamps(thread_2), {"time": "4.000000004", "conttime": "400"}
+        )
+        self.assertNotIn("qThreadStopInfo2", self.received())
+
+    @skipIfXmlSupportMissing
+    def test_later_replies_do_not_change_a_stop(self):
+        # The reply that creates a thread's stop decides its timestamps. A
+        # later reply about the same stop does not add, replace or remove them.
+        responder = StopResponder(
+            [
+                "T02thread:1;threads:1,2,3;",
+                # Thread 1: only a wall time.
+                "T02thread:1;threads:1,2,3;time:1.000000001;"
+                + jstopinfo(
+                    thread_info(1, "1.000000001", "100"),
+                    thread_info(2, "2.000000002", "200"),
+                    thread_info(3, "3.000000003", "300"),
+                ),
+            ],
+            # Read at the public stop after the resume.
+            threads_info={
+                0: [],
+                1: [
+                    # Adds a field.
+                    thread_info(1, "1.000000001", "100"),
+                    # Conflicts.
+                    thread_info(2, "7.000000007", "700"),
+                    # Omits both fields.
+                    thread_info(3),
+                ],
+            },
+        )
+        process = self.connect_to(responder)
+        self.assertSuccess(process.Continue())
+        self.assertEqual(responder.current, 1)
+        # Only requested at a public stop, which needs a resume.
+        self.assertPacketLogReceived(["jThreadsInfo"])
+        self.assertEqual(
+            self.stop_timestamps(process.GetThreadByID(1)), {"time": "1.000000001"}
         )
         self.assertEqual(
             self.stop_timestamps(process.GetThreadByID(2)),
             {"time": "2.000000002", "conttime": "200"},
+        )
+        self.assertEqual(
+            self.stop_timestamps(process.GetThreadByID(3)),
+            {"time": "3.000000003", "conttime": "300"},
         )
 
     @skipIfXmlSupportMissing
@@ -248,18 +338,13 @@ class TestGDBRemoteStopTimestamps(GDBRemoteTestBase):
                 # A new stop without times does not reuse the old ones.
                 "T02thread:1;threads:1,2;" + jstopinfo(thread_info(1)),
             ],
-            # What jThreadsInfo says at each public stop: at the second one,
-            # it reports a new time for the suspended thread 2 as well.
             threads_info={
-                0: [
-                    thread_info(1, "1.000000001", "100"),
-                    thread_info(2, "2.000000002", "200"),
-                ],
+                0: [],
                 1: [
-                    thread_info(1, "3.000000003", "300"),
+                    thread_info(1, "6.000000006", "600"),
                     thread_info(2, "5.000000005", "500"),
                 ],
-                2: [thread_info(1)],
+                2: [],
             },
         )
         process = self.connect_to(responder)

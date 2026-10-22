@@ -454,16 +454,8 @@ bool MachThread::NotifyException(MachException::Data &exc) {
   // See also MachThread::GetStopException().
   bool handled = m_arch_up->NotifyException(exc);
 
-  if (m_stop_exception.IsValid()) {
-    // We may have more than one exception for a thread, but we need to
-    // only remember the one that we will say is the reason we stopped.
-    // We may have been single stepping and also gotten a signal exception,
-    // so just remember the most pertinent one.
-    if (m_stop_exception.IsBreakpoint())
-      m_stop_exception = exc;
-  } else {
-    m_stop_exception = exc;
-  }
+  // Remember only the exception we will say is the reason we stopped.
+  m_stop_exception.UpdateWithLaterException(exc);
 
   return handled;
 }
