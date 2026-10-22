@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "gtest/gtest-spi.h"
 #include "gtest/gtest.h"
 
 #include "DNBDefs.h"
@@ -16,12 +17,14 @@
 #include <mach/mig_errors.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
@@ -600,40 +603,147 @@ testing::AssertionResult LeaveRequestsInEveryState(ExceptionServer &server) {
 const std::vector<kern_return_t> kEveryStateResults = {
     KERN_SUCCESS, MIG_SERVER_DIED, MIG_SERVER_DIED, MACH_SEND_INVALID_DEST};
 
-// Writes the outcome to stderr, where the death test's parent reads it, and
-// exits successfully only if the setup worked and the shutdown released every
-// sender as expected without errors.
-[[noreturn]] void ExitWithReport(const std::string &setup,
-                                 const ShutdownReport &report) {
-  fprintf(stderr, "setup: %s\nresults:", setup.c_str());
-  for (kern_return_t result : report.results)
-    fprintf(stderr, " %d", result);
-  fprintf(stderr, "\nerrors: %zu\n", report.errors.size());
-  for (const std::string &error : report.errors)
-    fprintf(stderr, "error: %s\n", error.c_str());
-  const bool ok = setup == "ok" && report.results == kEveryStateResults &&
-                  report.errors.empty();
-  std::_Exit(ok ? 0 : 1);
-}
-
-std::string ExpectedReport() {
-  std::string expected = "setup: ok\nresults:";
-  for (kern_return_t result : kEveryStateResults)
-    expected += " " + std::to_string(result);
-  return expected + "\nerrors: 0\n";
+std::string ResultsLine(const std::vector<kern_return_t> &results) {
+  std::string line = "results:";
+  for (kern_return_t result : results)
+    line += " " + std::to_string(result);
+  return line + "\n";
 }
 
 std::string Describe(const testing::AssertionResult &result) {
   return result ? "ok" : std::string("failed: ") + result.message();
 }
 
-// A test that fails with requests in every state.
-void FailWithRequestsInEveryState(ShutdownReport &report, std::string &setup) {
-  ExceptionServer server(&report);
+// How the every-state tests shut the server down.
+enum class Cleanup {
+  // Shutdown() after the setup.
+  Explicit,
+  // The destructor, after a fatal assertion returns from the test.
+  EarlyReturn,
+};
+
+// What one run of the every-state setup and shutdown did.
+struct ChildRun {
+  std::string setup = "not run";
+  ShutdownReport report;
+  // The line of the fatal assertion the run is meant to fail with, or 0.
+  int intended_line = 0;
+  // Every GoogleTest result recorded while setting up and shutting down,
+  // including while the server is destroyed.
+  testing::TestPartResultArray failures;
+};
+
+void NoInjection(ExceptionServer &) {}
+
+// Leaves requests in every state and shuts down the way cleanup says.
+// inject runs after the setup, so that a test can add what a defect would.
+void SetUpAndShutDown(Cleanup cleanup, ChildRun &run,
+                      const std::function<void(ExceptionServer &)> &inject) {
+  ExceptionServer server(cleanup == Cleanup::EarlyReturn ? &run.report
+                                                         : nullptr);
   testing::AssertionResult ok = LeaveRequestsInEveryState(server);
-  setup = Describe(ok);
+  run.setup = Describe(ok);
+  inject(server);
+  if (cleanup == Cleanup::Explicit) {
+    run.report = server.Shutdown();
+    // Destroying the server after shutting it down is safe.
+    return;
+  }
   ASSERT_TRUE(ok);
+  run.intended_line = __LINE__ + 1;
   ASSERT_TRUE(false) << "injected early return";
+}
+
+// Describes the run and decides whether it went as intended: the setup
+// worked, every sender got the result its state gives, shutdown had no
+// errors, and the only GoogleTest result is the intended fatal assertion,
+// exactly once, if the run has one.
+bool Evaluate(const ChildRun &run, std::string &description) {
+  std::ostringstream out;
+  out << "setup: " << run.setup << "\n" << ResultsLine(run.report.results);
+  out << "errors: " << run.report.errors.size() << "\n";
+  for (const std::string &error : run.report.errors)
+    out << "error: " << error << "\n";
+  int intended = 0;
+  std::vector<std::string> others;
+  for (int i = 0; i < run.failures.size(); ++i) {
+    const testing::TestPartResult &result = run.failures.GetTestPartResult(i);
+    const char *file = result.file_name() ? result.file_name() : "";
+    if (run.intended_line != 0 && result.fatally_failed() &&
+        result.line_number() == run.intended_line &&
+        std::string(file) == __FILE__) {
+      ++intended;
+      continue;
+    }
+    std::string message = result.message();
+    std::replace(message.begin(), message.end(), '\n', ' ');
+    others.push_back(std::string(result.fatally_failed()      ? "fatal"
+                                 : result.nonfatally_failed() ? "nonfatal"
+                                                              : "skipped") +
+                     " " + file + ":" + std::to_string(result.line_number()) +
+                     ": " + message);
+  }
+  out << "intended failures: " << intended << "\n";
+  out << "other failures: " << others.size() << "\n";
+  for (const std::string &other : others)
+    out << "failure: " << other << "\n";
+  description = out.str();
+  return run.setup == "ok" && run.report.results == kEveryStateResults &&
+         run.report.errors.empty() &&
+         intended == (run.intended_line != 0 ? 1 : 0) && others.empty();
+}
+
+// Runs the setup and shutdown with every GoogleTest result intercepted until
+// the server is destroyed, writes the description to stderr, where the death
+// test's parent reads it, and exits successfully only if Evaluate() accepts
+// the run. A hang ends the child with SIGALRM.
+[[noreturn]] void
+RunChild(Cleanup cleanup,
+         const std::function<void(ExceptionServer &)> &inject = NoInjection) {
+  alarm(10);
+  ChildRun run;
+  {
+    testing::ScopedFakeTestPartResultReporter reporter(
+        testing::ScopedFakeTestPartResultReporter::INTERCEPT_ALL_THREADS,
+        &run.failures);
+    SetUpAndShutDown(cleanup, run, inject);
+  }
+  std::string description;
+  const bool ok = Evaluate(run, description);
+  fputs(description.c_str(), stderr);
+  std::_Exit(ok ? 0 : 1);
+}
+
+std::string ExpectedReport(Cleanup cleanup) {
+  return "setup: ok\n" + ResultsLine(kEveryStateResults) +
+         "errors: 0\nintended failures: " +
+         (cleanup == Cleanup::EarlyReturn ? "1" : "0") +
+         "\nother failures: 0\n";
+}
+
+// Runs the child both ways with inject and expects it to fail, with
+// diagnostic in its output, however right the rest of the run looks.
+void ExpectChildFails(const std::function<void(ExceptionServer &)> &inject,
+                      const std::string &diagnostic) {
+  for (Cleanup cleanup : {Cleanup::Explicit, Cleanup::EarlyReturn}) {
+    SCOPED_TRACE(cleanup == Cleanup::Explicit ? "explicit shutdown"
+                                              : "early return");
+    EXPECT_EXIT(RunChild(cleanup, inject), testing::ExitedWithCode(1),
+                diagnostic);
+  }
+}
+
+// Evaluate() for a run that went right except for its GoogleTest results.
+bool Accepts(int intended_line,
+             const std::vector<testing::TestPartResult> &failures) {
+  ChildRun run;
+  run.setup = "ok";
+  run.report.results = kEveryStateResults;
+  run.intended_line = intended_line;
+  for (const testing::TestPartResult &failure : failures)
+    run.failures.Append(failure);
+  std::string description;
+  return Evaluate(run, description);
 }
 } // namespace
 
@@ -641,31 +751,108 @@ void FailWithRequestsInEveryState(ShutdownReport &report, std::string &setup) {
 // ends it with SIGALRM, which fails these tests.
 TEST(ExceptionServer, ShutdownReleasesSendersInEveryState) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
-  EXPECT_EXIT(
-      {
-        alarm(10);
-        std::string setup;
-        ShutdownReport report;
-        {
-          ExceptionServer server;
-          setup = Describe(LeaveRequestsInEveryState(server));
-          report = server.Shutdown();
-          // Destroying the server after shutting it down is safe.
-        }
-        ExitWithReport(setup, report);
-      },
-      testing::ExitedWithCode(0), ExpectedReport());
+  EXPECT_EXIT(RunChild(Cleanup::Explicit), testing::ExitedWithCode(0),
+              ExpectedReport(Cleanup::Explicit));
 }
 
 TEST(ExceptionServer, EarlyReturnReleasesSendersInEveryState) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
-  EXPECT_EXIT(
-      {
-        alarm(10);
-        ShutdownReport report;
-        std::string setup = "not run";
-        FailWithRequestsInEveryState(report, setup);
-        ExitWithReport(setup, report);
+  EXPECT_EXIT(RunChild(Cleanup::EarlyReturn), testing::ExitedWithCode(0),
+              ExpectedReport(Cleanup::EarlyReturn));
+}
+
+TEST(ExceptionServer, UnexpectedNonfatalFailureFailsTheChild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ExpectChildFails(
+      [](ExceptionServer &) { ADD_FAILURE() << "unexpected failure"; },
+      "other failures: 1\nfailure: nonfatal .*unexpected failure");
+}
+
+TEST(ExceptionServer, ExhaustedSamplesFailTheChild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  // Receiving the queued request leaves it unanswered, so every sender still
+  // gets the result its state gives.
+  ExpectChildFails(
+      [](ExceptionServer &server) {
+        MachException::Message extra;
+        (void)server.Receive(mach_task_self(), extra);
       },
-      testing::ExitedWithCode(0), ExpectedReport());
+      ResultsLine(kEveryStateResults) +
+          "errors: 0\n.*other failures: 1\nfailure: nonfatal .*received more "
+          "messages than the test has samples for");
+}
+
+TEST(ExceptionServer, OtherFatalFailureFailsTheChild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  // The same message as the intended assertion, from another line.
+  ExpectChildFails(
+      [](ExceptionServer &) { ASSERT_TRUE(false) << "injected early return"; },
+      "other failures: 1\nfailure: fatal .*injected early return");
+}
+
+TEST(ExceptionServer, CleanupErrorFailsTheChild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  // Releasing a receive right early makes shutdown's release of it fail. The
+  // name stays reserved as a dead name.
+  ExpectChildFails(
+      [](ExceptionServer &server) {
+        mach_port_mod_refs(mach_task_self(), server.NewPort(),
+                           MACH_PORT_RIGHT_RECEIVE, -1);
+      },
+      "errors: 1\nerror: release receive right 0x[0-9a-f]+: "
+      "\\(os/kern\\) invalid right \\(17\\)\n");
+}
+
+TEST(ExceptionServer, UnexpectedSenderResultFailsTheChild) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  std::vector<kern_return_t> results = kEveryStateResults;
+  results.push_back(MACH_SEND_INVALID_DEST);
+  ExpectChildFails(
+      [](ExceptionServer &server) {
+        server.Raise(server.NewPort(), server.NewPort(), EXC_BREAKPOINT,
+                     {1, 0x5000}, ExceptionServer::Start::AtShutdown);
+      },
+      ResultsLine(results) + "errors: 0\n");
+}
+
+TEST(ExceptionServer, OnlyTheIntendedFailureIsAccepted) {
+  using testing::TestPartResult;
+  const int line = 1000;
+  const TestPartResult intended(TestPartResult::kFatalFailure, __FILE__, line,
+                                "injected early return");
+  EXPECT_TRUE(Accepts(line, {intended}));
+  // Missing, repeated, or with another failure.
+  EXPECT_FALSE(Accepts(line, {}));
+  EXPECT_FALSE(Accepts(line, {intended, intended}));
+  EXPECT_FALSE(
+      Accepts(line, {intended, TestPartResult(TestPartResult::kNonFatalFailure,
+                                              __FILE__, line + 1, "other")}));
+  // Nonfatal, or from another line or file.
+  EXPECT_FALSE(
+      Accepts(line, {TestPartResult(TestPartResult::kNonFatalFailure, __FILE__,
+                                    line, "injected early return")}));
+  EXPECT_FALSE(
+      Accepts(line, {TestPartResult(TestPartResult::kFatalFailure, __FILE__,
+                                    line + 1, "injected early return")}));
+  EXPECT_FALSE(
+      Accepts(line, {TestPartResult(TestPartResult::kFatalFailure, "other.cpp",
+                                    line, "injected early return")}));
+  // A skip is not a pass.
+  EXPECT_FALSE(
+      Accepts(line, {intended, TestPartResult(TestPartResult::kSkip, __FILE__,
+                                              line + 1, "skipped")}));
+  // Without an intended assertion, no failure is accepted.
+  EXPECT_TRUE(Accepts(0, {}));
+  EXPECT_FALSE(Accepts(0, {intended}));
+}
+
+TEST(ExceptionServer, DestructorReportsCleanupErrorsAsFailures) {
+  // Without a report, shutdown errors are test failures.
+  EXPECT_NONFATAL_FAILURE(
+      {
+        ExceptionServer server;
+        mach_port_mod_refs(mach_task_self(), server.NewPort(),
+                           MACH_PORT_RIGHT_RECEIVE, -1);
+      },
+      "shutdown: release receive right");
 }
