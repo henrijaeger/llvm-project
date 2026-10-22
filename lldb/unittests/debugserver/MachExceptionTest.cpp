@@ -16,14 +16,17 @@
 #include <mach/mig_errors.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <future>
 #include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,23 +89,49 @@ std::string Describe(kern_return_t kr) {
   return std::string(mach_error_string(kr)) + " (" + std::to_string(kr) + ")";
 }
 
+std::string Hex(mach_port_t port) {
+  std::ostringstream stream;
+  stream << "0x" << std::hex << port;
+  return stream.str();
+}
+
+// What shutting an ExceptionServer down did.
+struct ShutdownReport {
+  // What each sender's mach_exception_raise() returned, in the order they
+  // were raised: KERN_SUCCESS if answered, MIG_SERVER_DIED if its request was
+  // received or queued but not answered, MACH_SEND_INVALID_DEST if it had not
+  // sent yet.
+  std::vector<kern_return_t> results;
+  // Every Mach call during shutdown that did not succeed.
+  std::vector<std::string> errors;
+};
+
 // Receives exception messages that helper threads send, as debugserver
 // receives the kernel's. The threads wait for replies, so whatever a test
-// does, the destructor first releases every request that was not answered
-// and only then waits for the threads.
+// does, shutdown first releases every request that was not answered and only
+// then waits for the threads.
 class ExceptionServer {
 public:
-  // results, if given, receives what each sender's mach_exception_raise()
-  // returned, in the order they were raised.
-  explicit ExceptionServer(std::vector<kern_return_t> *results = nullptr)
-      : m_results(results) {
+  // When a sender sends its request.
+  enum class Start { Now, AtShutdown };
+
+  // report, if given, receives what the destructor's shutdown did. Without
+  // one, its errors are reported as test failures.
+  explicit ExceptionServer(ShutdownReport *report = nullptr)
+      : m_report(report) {
     m_port = NewPort();
   }
 
   ~ExceptionServer() {
-    std::vector<kern_return_t> results = Shutdown();
-    if (m_results)
-      *m_results = std::move(results);
+    if (m_shut_down)
+      return;
+    ShutdownReport report = Shutdown();
+    if (m_report) {
+      *m_report = std::move(report);
+      return;
+    }
+    for (const std::string &error : report.errors)
+      ADD_FAILURE() << "shutdown: " << error;
   }
 
   // The port the server receives on.
@@ -121,22 +150,55 @@ public:
     m_ports.push_back(port);
     kr = mach_port_insert_right(mach_task_self(), port, port,
                                 MACH_MSG_TYPE_MAKE_SEND);
-    EXPECT_EQ(kr, KERN_SUCCESS) << "mach_port_insert_right: " << Describe(kr);
+    EXPECT_EQ(kr, KERN_SUCCESS)
+        << "mach_port_insert_right " << Hex(port) << ": " << Describe(kr);
     return port;
   }
 
   // Sends an exception message from a new thread, which waits for a reply
-  // the way a thread that raised an exception does.
+  // the way a thread that raised an exception does. With Start::AtShutdown,
+  // the thread sends only after shutdown has destroyed the server's ports.
   void Raise(mach_port_t thread, mach_port_t task, exception_type_t type,
-             std::vector<mach_exception_data_type_t> code) {
+             std::vector<mach_exception_data_type_t> code,
+             Start start = Start::Now) {
     auto sender = std::make_unique<Sender>();
     Sender *s = sender.get();
+    std::shared_future<void> go;
+    if (start == Start::AtShutdown)
+      go = s->go.get_future().share();
     const mach_port_t port = m_port;
-    s->thread = std::thread([s, port, thread, task, type, code]() mutable {
+    s->thread = std::thread([s, go, port, thread, task, type, code]() mutable {
+      if (go.valid())
+        go.wait();
       s->result = mach_exception_raise(port, thread, task, type, code.data(),
                                        code.size());
     });
+    s->held = start == Start::AtShutdown;
     m_senders.push_back(std::move(sender));
+  }
+
+  // Waits until exactly count messages are queued on the receive port, so a
+  // test knows a request was sent but not received.
+  testing::AssertionResult WaitUntilQueued(natural_t count) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    mach_port_status_t status = {};
+    do {
+      mach_msg_type_number_t size = MACH_PORT_RECEIVE_STATUS_COUNT;
+      kern_return_t kr = mach_port_get_attributes(
+          mach_task_self(), m_port, MACH_PORT_RECEIVE_STATUS,
+          reinterpret_cast<mach_port_info_t>(&status), &size);
+      if (kr != KERN_SUCCESS)
+        return testing::AssertionFailure()
+               << "mach_port_get_attributes " << Hex(m_port) << ": "
+               << Describe(kr);
+      if (status.mps_msgcount == count)
+        return testing::AssertionSuccess();
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return testing::AssertionFailure()
+           << "expected " << count << " queued messages on " << Hex(m_port)
+           << " within 5 s, found " << status.mps_msgcount;
   }
 
   // Receives the next message within timeout_ms and decodes it for task.
@@ -173,36 +235,63 @@ public:
     return testing::AssertionSuccess();
   }
 
-  // Releases every request that was not answered and waits for all senders.
-  // A released sender gets MIG_SERVER_DIED. Returns their results in the
-  // order they were raised.
-  std::vector<kern_return_t> Shutdown() {
+  // Releases every request that was not answered, waits for all senders,
+  // and releases the server's ports. Every step is attempted even if an
+  // earlier one fails. A later call does nothing.
+  ShutdownReport Shutdown() {
+    ShutdownReport report;
+    if (m_shut_down)
+      return report;
+    m_shut_down = true;
+    auto check = [&report](kern_return_t kr, const std::string &what) {
+      if (kr != KERN_SUCCESS)
+        report.errors.push_back(what + ": " + Describe(kr));
+    };
     // Dropping the reply right of a received request wakes its sender.
     for (mach_port_t reply_port : m_unanswered)
-      mach_port_deallocate(mach_task_self(), reply_port);
+      check(mach_port_deallocate(mach_task_self(), reply_port),
+            "deallocate reply right " + Hex(reply_port));
     m_unanswered.clear();
-    // Destroying the ports discards requests still queued, which wakes
-    // their senders too.
+    // Dropping the receive rights discards the requests still queued, which
+    // wakes their senders too. The send rights become dead names, so the
+    // names cannot be reused while senders that have not sent yet use them.
     for (mach_port_t port : m_ports)
-      mach_port_destroy(mach_task_self(), port);
-    m_ports.clear();
-    std::vector<kern_return_t> results;
+      check(mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE,
+                               -1),
+            "release receive right " + Hex(port));
+    for (std::unique_ptr<Sender> &sender : m_senders)
+      if (sender->held)
+        sender->go.set_value();
     for (std::unique_ptr<Sender> &sender : m_senders) {
-      if (sender->thread.joinable())
-        sender->thread.join();
-      results.push_back(sender->result);
+      sender->thread.join();
+      report.results.push_back(sender->result);
     }
     m_senders.clear();
-    return results;
+    for (mach_port_t port : m_ports) {
+      mach_port_urefs_t refs = 0;
+      kern_return_t kr = mach_port_get_refs(mach_task_self(), port,
+                                            MACH_PORT_RIGHT_DEAD_NAME, &refs);
+      check(kr, "count dead-name references of " + Hex(port));
+      if (kr == KERN_SUCCESS && refs > 0)
+        check(mach_port_mod_refs(mach_task_self(), port,
+                                 MACH_PORT_RIGHT_DEAD_NAME,
+                                 -static_cast<mach_port_delta_t>(refs)),
+              "release dead name " + Hex(port));
+    }
+    m_ports.clear();
+    return report;
   }
 
 private:
   struct Sender {
     std::thread thread;
+    bool held = false;
+    std::promise<void> go;
     kern_return_t result = KERN_FAILURE;
   };
 
-  std::vector<kern_return_t> *m_results;
+  ShutdownReport *m_report;
+  bool m_shut_down = false;
   mach_port_t m_port = MACH_PORT_NULL;
   std::vector<mach_port_t> m_ports;
   std::set<mach_port_t> m_unanswered;
@@ -400,8 +489,10 @@ TEST(MachExceptionMessage, EachMessageInABundleKeepsItsOwnSample) {
 
   for (MachException::Message &message : bundle)
     EXPECT_TRUE(server.Reply(message));
-  EXPECT_EQ(server.Shutdown(),
+  ShutdownReport report = server.Shutdown();
+  EXPECT_EQ(report.results,
             std::vector<kern_return_t>({KERN_SUCCESS, KERN_SUCCESS}));
+  EXPECT_EQ(report.errors, std::vector<std::string>());
 }
 
 TEST(MachExceptionMessage, RejectedMessageChangesNothing) {
@@ -433,10 +524,11 @@ TEST(MachExceptionMessage, RejectedMessageChangesNothing) {
 
   EXPECT_TRUE(server.Reply(accepted));
   EXPECT_TRUE(server.Reply(rejected));
-  std::vector<kern_return_t> results = server.Shutdown();
-  ASSERT_EQ(results.size(), 2u);
-  EXPECT_EQ(results[0], KERN_SUCCESS);
-  EXPECT_NE(results[1], KERN_SUCCESS);
+  ShutdownReport report = server.Shutdown();
+  ASSERT_EQ(report.results.size(), 2u);
+  EXPECT_EQ(report.results[0], KERN_SUCCESS);
+  EXPECT_EQ(report.results[1], KERN_FAILURE);
+  EXPECT_EQ(report.errors, std::vector<std::string>());
 }
 
 TEST(ExceptionServer, NothingReceivedNothingDecoded) {
@@ -476,40 +568,104 @@ TEST(ExceptionServer, OtherMessagesAreNotDecoded) {
 }
 
 namespace {
-// What a failing test leaves behind: one request received and not answered,
-// and one still queued, when a fatal assertion returns.
-void ReturnEarlyWithRequestsOutstanding(std::vector<kern_return_t> &results,
-                                        bool &returned_early) {
+// Leaves one request in each state a sender can be in at shutdown: answered,
+// received but not answered, queued but not received, and not sent yet.
+// Returns whether every step of the setup worked.
+testing::AssertionResult LeaveRequestsInEveryState(ExceptionServer &server) {
   g_samples = {MakeTimestamp(1, 0, 1), MakeTimestamp(2, 0, 2)};
-  ExceptionServer server(&results);
   const mach_port_t task = server.NewPort();
+
   server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x1000});
+  MachException::Message answered;
+  testing::AssertionResult ok = server.Receive(task, answered);
+  if (!ok)
+    return ok;
+  if (!(ok = server.Reply(answered)))
+    return ok;
+
   server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x2000});
-  MachException::Message received;
-  ASSERT_TRUE(server.Receive(task, received));
-  returned_early = true;
+  MachException::Message unanswered;
+  if (!(ok = server.Receive(task, unanswered)))
+    return ok;
+
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x3000});
+  if (!(ok = server.WaitUntilQueued(1)))
+    return ok;
+
+  server.Raise(server.NewPort(), task, EXC_BREAKPOINT, {1, 0x4000},
+               ExceptionServer::Start::AtShutdown);
+  return testing::AssertionSuccess();
+}
+
+const std::vector<kern_return_t> kEveryStateResults = {
+    KERN_SUCCESS, MIG_SERVER_DIED, MIG_SERVER_DIED, MACH_SEND_INVALID_DEST};
+
+// Writes the outcome to stderr, where the death test's parent reads it, and
+// exits successfully only if the setup worked and the shutdown released every
+// sender as expected without errors.
+[[noreturn]] void ExitWithReport(const std::string &setup,
+                                 const ShutdownReport &report) {
+  fprintf(stderr, "setup: %s\nresults:", setup.c_str());
+  for (kern_return_t result : report.results)
+    fprintf(stderr, " %d", result);
+  fprintf(stderr, "\nerrors: %zu\n", report.errors.size());
+  for (const std::string &error : report.errors)
+    fprintf(stderr, "error: %s\n", error.c_str());
+  const bool ok = setup == "ok" && report.results == kEveryStateResults &&
+                  report.errors.empty();
+  std::_Exit(ok ? 0 : 1);
+}
+
+std::string ExpectedReport() {
+  std::string expected = "setup: ok\nresults:";
+  for (kern_return_t result : kEveryStateResults)
+    expected += " " + std::to_string(result);
+  return expected + "\nerrors: 0\n";
+}
+
+std::string Describe(const testing::AssertionResult &result) {
+  return result ? "ok" : std::string("failed: ") + result.message();
+}
+
+// A test that fails with requests in every state.
+void FailWithRequestsInEveryState(ShutdownReport &report, std::string &setup) {
+  ExceptionServer server(&report);
+  testing::AssertionResult ok = LeaveRequestsInEveryState(server);
+  setup = Describe(ok);
+  ASSERT_TRUE(ok);
   ASSERT_TRUE(false) << "injected early return";
-  returned_early = false;
 }
 } // namespace
 
-TEST(ExceptionServer, EarlyReturnReleasesEveryRequest) {
-  // Cleanup runs in a child process that must finish within the bound; a
-  // hang ends it with SIGALRM, which fails this test.
+// Shutdown runs in a child process that must finish within the bound; a hang
+// ends it with SIGALRM, which fails these tests.
+TEST(ExceptionServer, ShutdownReleasesSendersInEveryState) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(
       {
         alarm(10);
-        std::vector<kern_return_t> results;
-        bool returned_early = false;
-        ReturnEarlyWithRequestsOutstanding(results, returned_early);
-        fprintf(stderr, "returned early: %d, senders:", returned_early);
-        for (kern_return_t result : results)
-          fprintf(stderr, " %d", result);
-        fprintf(stderr, "\n");
-        std::_Exit(0);
+        std::string setup;
+        ShutdownReport report;
+        {
+          ExceptionServer server;
+          setup = Describe(LeaveRequestsInEveryState(server));
+          report = server.Shutdown();
+          // Destroying the server after shutting it down is safe.
+        }
+        ExitWithReport(setup, report);
       },
-      testing::ExitedWithCode(0),
-      "returned early: 1, senders: " + std::to_string(MIG_SERVER_DIED) + " " +
-          std::to_string(MIG_SERVER_DIED) + "\n");
+      testing::ExitedWithCode(0), ExpectedReport());
+}
+
+TEST(ExceptionServer, EarlyReturnReleasesSendersInEveryState) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        alarm(10);
+        ShutdownReport report;
+        std::string setup = "not run";
+        FailWithRequestsInEveryState(report, setup);
+        ExitWithReport(setup, report);
+      },
+      testing::ExitedWithCode(0), ExpectedReport());
 }
